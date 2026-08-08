@@ -94,6 +94,28 @@ func externalCount() -> Int {
     activeDisplays().filter { CGDisplayIsBuiltin($0) == 0 }.count
 }
 
+// CoreGraphics caches the display list per process, and display-reconfiguration
+// events are not delivered to launchd-managed processes on Tahoe — so in the
+// long-running watch daemon externalCount() reports the topology from launch
+// time. A short-lived child process gets a fresh WindowServer connection and
+// therefore the real current list.
+func freshExternalCount() -> Int {
+    guard let exe = Bundle.main.executableURL else { return externalCount() }
+    let p = Process()
+    p.executableURL = exe
+    p.arguments = ["external-count"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return externalCount() }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0,
+          let n = Int(String(data: data, encoding: .utf8)?
+              .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") else { return externalCount() }
+    return n
+}
+
 func allModes(_ d: CGDirectDisplayID) -> [CGDisplayMode] {
     let opts = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
     return (CGDisplayCopyAllDisplayModes(d, opts) as? [CGDisplayMode]) ?? []
@@ -245,7 +267,7 @@ final class Watcher {
     }
 
     private func onEveLaunch() {
-        let ext = externalCount()
+        let ext = freshExternalCount()
         guard ext == 0 else {
             log("EVE launched, \(ext) external(s) connected — no change")
             return
@@ -384,6 +406,10 @@ case "reset":
 
 case "watch":
     runWatch(cfg: config)
+
+// Internal: fresh-process external display count for the watch daemon.
+case "external-count":
+    print(externalCount())
 
 case "help", "-h":
     print(usage)
