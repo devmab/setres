@@ -37,6 +37,8 @@ else
 resolution=${W}x${H}
 hidpi=false
 # hz=60
+# bundle IDs that trigger \`setres watch\` (launchers + game clients)
+apps=com.ccpgames.eve-online-launcher,com.ccpgames.eveonline,net.battle.app,com.blizzard.worldofwarcraft
 EOF
     echo "Wrote default config $CONFIG (resolution=${W}x${H})"
 fi
@@ -99,4 +101,4 @@ echo "Installed $TARGET"
 echo
 echo "REBOOT to activate, then verify with: setres list ${W}x${H}"
 echo "Uninstall override: sudo rm '$TARGET'  (then reboot)"
-echo "Optional EVE auto-switch: see 'Auto-switch on EVE launch' in README.md"
+echo "Optional auto-switch on game launch: see 'Auto-switch on game launch' in README.md"

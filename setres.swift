@@ -6,8 +6,10 @@
 //   setres set [WxH] [--hidpi] [--hz N]   switch built-in display (saves previous mode)
 //   setres reset                   return to the mode saved by `set` (or panel default)
 //   setres list [WxH]              list modes of the built-in display (optionally filtered)
-//   setres status                  current mode, saved mode, EVE state, external count
-//   setres watch [WxH] [--hidpi]   daemon: EVE launches + no externals -> WxH; EVE quits -> reset
+//   setres status                  current mode, saved mode, watched apps, external count
+//   setres apps                    running apps with bundle IDs (* = watched)
+//   setres watch [WxH] [--hidpi]   daemon: watched app launches + no externals -> WxH;
+//                                  all watched apps quit -> reset
 //   setres help
 //
 // Low-res (1:1 pixel) modes are the default; --hidpi (or hidpi=true in config) picks
@@ -18,6 +20,7 @@
 //   resolution=1920x1080
 //   hidpi=false
 //   hz=60          (optional)
+//   apps=net.battle.app,com.blizzard.worldofwarcraft   (bundle IDs watched by `watch`)
 //
 // Build: swiftc -O setres.swift -o ~/.local/bin/setres
 
@@ -25,7 +28,12 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-let eveBundleIDs: Set<String> = ["com.ccpgames.eve-online-launcher", "com.ccpgames.eveonline"]
+// Launchers trigger the switch before the game starts; game clients keep the
+// session alive when the launcher quits while the game runs.
+let defaultApps: Set<String> = [
+    "com.ccpgames.eve-online-launcher", "com.ccpgames.eveonline",
+    "net.battle.app", "com.blizzard.worldofwarcraft",
+]
 let configDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".config/setres")
 let stateURL = configDir.appendingPathComponent("saved-mode")
@@ -44,6 +52,7 @@ struct Config {
     var height = 1080
     var hidpi = false
     var hz: Double?
+    var apps = defaultApps
 }
 
 func parseWxH(_ s: String) -> (Int, Int)? {
@@ -67,6 +76,11 @@ func loadConfig() -> Config {
             c.hidpi = ["true", "1", "yes"].contains(kv[1].lowercased())
         case "hz":
             c.hz = Double(kv[1])
+        case "apps":
+            let ids = kv[1].split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            if !ids.isEmpty { c.apps = Set(ids) }
         default:
             break
         }
@@ -208,26 +222,33 @@ func resetSaved(_ d: CGDirectDisplayID) -> String {
     return "reset failed"
 }
 
-// MARK: - EVE watcher
+// MARK: - App watcher
 
-func eveRunning() -> Bool {
-    NSWorkspace.shared.runningApplications.contains {
-        eveBundleIDs.contains($0.bundleIdentifier ?? "")
-    }
+func appName(_ app: NSRunningApplication) -> String {
+    app.localizedName ?? app.bundleIdentifier ?? "pid \(app.processIdentifier)"
+}
+
+func runningWatched(_ apps: Set<String>) -> [NSRunningApplication] {
+    NSWorkspace.shared.runningApplications.filter { apps.contains($0.bundleIdentifier ?? "") }
+}
+
+func describeRunning(_ apps: Set<String>) -> String {
+    let names = runningWatched(apps).map(appName)
+    return names.isEmpty ? "none" : names.joined(separator: ", ")
 }
 
 // Edge-triggered, two triggers only:
-//   - EVE launches with no externals connected -> set target
-//   - all EVE processes quit                   -> reset
+//   - a watched app launches while none was running, no externals -> set target
+//   - the last watched app quits                                  -> reset
 // Display plug/unplug is deliberately ignored.
 final class Watcher {
     let cfg: Config
-    private var evePrev: Bool
+    private var activePrev: Bool
     private var pending: DispatchWorkItem?
 
     init(cfg: Config) {
         self.cfg = cfg
-        self.evePrev = eveRunning()
+        self.activePrev = !runningWatched(cfg.apps).isEmpty
     }
 
     func log(_ s: String) {
@@ -237,9 +258,10 @@ final class Watcher {
     }
 
     func start() {
-        log("watch started: target \(cfg.width)x\(cfg.height)\(cfg.hidpi ? " hidpi" : " low-res"), EVE running: \(evePrev)")
-        if evePrev {
-            log("EVE already running — leaving resolution alone")
+        log("watch started: target \(cfg.width)x\(cfg.height)\(cfg.hidpi ? " hidpi" : " low-res"), "
+            + "watching: \(cfg.apps.sorted().joined(separator: ", "))")
+        if activePrev {
+            log("already running: \(describeRunning(cfg.apps)) — leaving resolution alone")
         } else if FileManager.default.fileExists(atPath: stateURL.path), let d = builtinDisplay() {
             // Stale state from a previous run (crash/logout mid-game) — clean up.
             log(resetSaved(d))
@@ -248,32 +270,38 @@ final class Watcher {
 
     // Debounced path, used for quit events: a client restart shouldn't bounce
     // the resolution through a reset and straight back.
-    func schedule() {
+    func schedule(quit name: String) {
         pending?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.evaluate() }
+        let item = DispatchWorkItem { [weak self] in self?.evaluate(quit: name) }
         pending = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: item)
     }
 
-    // eveHint carries knowledge from the notification itself: at willLaunch
-    // time the app is not yet in runningApplications, so polling would miss it.
-    func evaluate(eveHint: Bool? = nil) {
+    // A launch is taken from the notification itself: at willLaunch time the
+    // app is not yet in runningApplications, so polling would miss it.
+    func evaluate(launched name: String) {
         pending?.cancel()
-        let now = eveHint ?? eveRunning()
-        let was = evePrev
-        evePrev = now
-        guard now != was else { return }
-        if now { onEveLaunch() } else { onEveQuit() }
+        let was = activePrev
+        activePrev = true
+        if !was { onLaunch(name) }
     }
 
-    private func onEveLaunch() {
+    private func evaluate(quit name: String) {
+        pending?.cancel()
+        let now = !runningWatched(cfg.apps).isEmpty
+        let was = activePrev
+        activePrev = now
+        if was && !now { onQuit(name) }
+    }
+
+    private func onLaunch(_ name: String) {
         let ext = freshExternalCount()
         guard ext == 0 else {
-            log("EVE launched, \(ext) external(s) connected — no change")
+            log("\(name) launched, \(ext) external(s) connected — no change")
             return
         }
         guard let d = builtinDisplay() else {
-            log("EVE launched, built-in display offline — no change")
+            log("\(name) launched, built-in display offline — no change")
             return
         }
         guard let t = pickMode(d, w: cfg.width, h: cfg.height, hidpi: cfg.hidpi,
@@ -282,23 +310,23 @@ final class Watcher {
             return
         }
         if let cur = CGDisplayCopyDisplayMode(d), cur.ioDisplayModeID == t.ioDisplayModeID {
-            log("EVE launched, already at \(modeDesc(t))")
+            log("\(name) launched, already at \(modeDesc(t))")
             return
         }
         saveCurrentModeIfNeeded(d)
-        log(apply(d, t) ? "EVE launched, no externals -> \(modeDesc(t))" : "failed to set \(modeDesc(t))")
+        log(apply(d, t) ? "\(name) launched, no externals -> \(modeDesc(t))" : "failed to set \(modeDesc(t))")
     }
 
-    private func onEveQuit() {
+    private func onQuit(_ name: String) {
         guard FileManager.default.fileExists(atPath: stateURL.path) else {
-            log("EVE quit, nothing to reset")
+            log("\(name) quit, nothing to reset")
             return
         }
         guard let d = builtinDisplay() else {
-            log("EVE quit, built-in display offline — reset skipped")
+            log("\(name) quit, built-in display offline — reset skipped")
             return
         }
-        log("EVE quit -> \(resetSaved(d))")
+        log("\(name) quit -> \(resetSaved(d))")
     }
 }
 
@@ -307,20 +335,20 @@ func runWatch(cfg: Config) -> Never {
     watcher.start()
 
     let nc = NSWorkspace.shared.notificationCenter
-    func observe(_ name: Notification.Name, _ handler: @escaping () -> Void) {
+    func observe(_ name: Notification.Name, _ handler: @escaping (String) -> Void) {
         nc.addObserver(forName: name, object: nil, queue: .main) { note in
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  eveBundleIDs.contains(app.bundleIdentifier ?? "") else { return }
-            handler()
+                  cfg.apps.contains(app.bundleIdentifier ?? "") else { return }
+            handler(appName(app))
         }
     }
     // willLaunch fires at process spawn, seconds before didLaunch (app checkin) —
     // reacting there switches the panel before the first window appears. Launch
     // events evaluate immediately; didLaunch stays as backup in case willLaunch
     // was missed; quits go through the debounce.
-    observe(NSWorkspace.willLaunchApplicationNotification) { watcher.evaluate(eveHint: true) }
-    observe(NSWorkspace.didLaunchApplicationNotification) { watcher.evaluate(eveHint: true) }
-    observe(NSWorkspace.didTerminateApplicationNotification) { watcher.schedule() }
+    observe(NSWorkspace.willLaunchApplicationNotification) { watcher.evaluate(launched: $0) }
+    observe(NSWorkspace.didLaunchApplicationNotification) { watcher.evaluate(launched: $0) }
+    observe(NSWorkspace.didTerminateApplicationNotification) { watcher.schedule(quit: $0) }
 
     RunLoop.main.run()
     exit(0)
@@ -336,7 +364,9 @@ setres — built-in display resolution switcher
   setres reset                    back to saved / panel default mode
   setres list [WxH]               list built-in display modes
   setres status                   current mode + watcher-relevant state
-  setres watch [WxH] [--hidpi]    auto: EVE launch + no externals -> target; EVE quit -> reset
+  setres apps                     running apps with bundle IDs (* = watched)
+  setres watch [WxH] [--hidpi]    auto: watched app launch + no externals -> target;
+                                  all watched apps quit -> reset (apps= in config)
 Low-res is default; --hidpi (or hidpi=true in config) picks the HiDPI variant.
 """
 
@@ -376,7 +406,8 @@ case "status":
     if let cur = CGDisplayCopyDisplayMode(d) { print("built-in: \(modeDesc(cur))") }
     print("saved mode: \(savedSignature() ?? "none")")
     print("externals online: \(externalCount())")
-    print("EVE running: \(eveRunning())")
+    print("watched apps: \(config.apps.sorted().joined(separator: ", "))")
+    print("watched running: \(describeRunning(config.apps))")
     print("config target: \(config.width)x\(config.height)\(config.hidpi ? " hidpi" : " low-res")"
           + (config.hz.map { String(format: " %.1fHz", $0) } ?? "")
           + (FileManager.default.fileExists(atPath: configURL.path) ? "" : " (built-in defaults, no config file)"))
@@ -403,6 +434,15 @@ case "set":
 case "reset":
     guard let d = builtinDisplay() else { fail("no built-in display online") }
     print(resetSaved(d))
+
+case "apps":
+    let apps = NSWorkspace.shared.runningApplications
+        .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
+        .sorted { appName($0).localizedCaseInsensitiveCompare(appName($1)) == .orderedAscending }
+    for app in apps {
+        let id = app.bundleIdentifier!
+        print("\(config.apps.contains(id) ? "*" : " ") \(id)  \(appName(app))")
+    }
 
 case "watch":
     runWatch(cfg: config)

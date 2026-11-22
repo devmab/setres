@@ -1,9 +1,9 @@
 # setres
 
 Built-in display resolution switcher for MacBooks. Built to replace SwitchResX for
-one job: run the built-in panel at 1920x1080 so EVE Online's overview layout
-survives launching on the road (no externals) vs. at the desk (external 1080p
-display).
+one job: run the built-in panel at 1920x1080 so game UI layouts (EVE Online's
+overview, World of Warcraft's) survive launching on the road (no externals) vs.
+at the desk (external 1080p display).
 
 macOS only exposes 16:10 modes on built-in panels (max 1920x1200 in System
 Settings). setres adds the missing mode via a display override
@@ -42,7 +42,8 @@ setres reset                        # back to what it was
 setres WxH                          # one-off target
 setres set [WxH] [--hidpi] [--hz N] # full form
 setres list [WxH]                   # all modes, hidden ones included
-setres status                       # current mode / saved / EVE / externals / target
+setres status                       # current mode / saved / watched apps / externals / target
+setres apps                         # running apps with bundle IDs (* = watched)
 setres watch [WxH] [--hidpi]        # daemon mode, see below
 ```
 
@@ -65,18 +66,42 @@ display's current refresh (60Hz stays 60Hz, ProMotion 120Hz stays 120Hz).
 resolution=1920x1080
 hidpi=false
 # hz=60
+# apps=com.ccpgames.eve-online-launcher,com.ccpgames.eveonline,net.battle.app,com.blizzard.worldofwarcraft
 ```
 
-### Auto-switch on EVE launch
+### Auto-switch on game launch
 
 `setres watch` runs as a daemon, strictly edge-triggered:
 
-- EVE launcher or client **launches** (`com.ccpgames.eve-online-launcher`,
-  `com.ccpgames.eveonline`) and **no external displays are connected** →
-  switch built-in panel to the configured target.
-- **All** EVE processes quit → reset to the previous mode.
+- A watched app **launches** while none was running and **no external displays
+  are connected** → switch built-in panel to the configured target.
+- The **last** watched app quits → reset to the previous mode (2s debounce, so
+  a launcher or client restart doesn't bounce the resolution).
 - Nothing else: display plug/unplug is deliberately ignored, and a watcher
-  starting while EVE is already running leaves the resolution alone.
+  starting while a watched app is already running leaves the resolution alone.
+
+Watched apps are bundle IDs from `apps=` in the config (comma-separated). Default:
+
+| Bundle ID | App |
+|---|---|
+| `com.ccpgames.eve-online-launcher` | EVE launcher |
+| `com.ccpgames.eveonline` | EVE client |
+| `net.battle.app` | Battle.net |
+| `com.blizzard.worldofwarcraft` | World of Warcraft client |
+
+Launchers are the trigger — the panel switches before the game starts. Clients
+are listed too so the session survives a launcher that quits while the game
+runs (Battle.net's "When I launch a game → exit" setting). Don't add background
+helpers such as `com.blizzard.agent`: they outlive the launcher and would block
+the reset.
+
+To add another game: launch it, run `setres apps`, copy its bundle ID into
+`apps=`. The list replaces the default, so keep the entries you still want.
+The daemon reads the config once at start — restart it after editing:
+
+```
+launchctl kickstart -k gui/$(id -u)/com.entropiadev.setres
+```
 
 Enable at login:
 
